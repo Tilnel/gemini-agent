@@ -1,0 +1,15 @@
+{
+  "database": {
+    "host": "localhost",
+    "port": 5432,
+    "user": "cardinal",
+    "password": "cardinal",
+    "dbname": "cardinal"
+  },
+  "agent_config": {
+    "max_size_gb": 4,
+    "embedding_model": "sentence-transformers/all-MiniLM-L6-v2",
+    "embedding_dim": 384
+  }
+}
+
