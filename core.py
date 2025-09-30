@@ -159,7 +159,7 @@ def consult_cardinal_knowledge(query: str) -> str:
 
 tools = [
     Tool(name="run_command", func=create_learning_wrapper(run_command, "run_command"), description="执行本地 shell 命令。例如: 'ls -l', 'cat file.txt', 'pip install <package>'。"),
-    Tool(name="google_search", func=create_learning_wrapper(search.run, "google_search"), description="当需要从互联网获取信息时使用。"),
+    Tool(name="google_search", func=create_learning_wrapper(search.run, "google_search"), description="当需要从互联网获取信息时使用。当你采信某个信源的时候，应当给出来源的网页。注意避免采取“今日”等模糊的日期指示，而是替换为真实的日期。"),
     Tool(name="fetch_webpage", func=create_learning_wrapper(fetch_webpage_content, "fetch_webpage"), description="获取特定 URL 的完整网页内容。输入应为一个有效的 URL。"),
     Tool(name="write_file", func=write_file, description="将内容写入文件。输入必须是包含 'file_path' 和 'content' 的JSON字符串。"),
     Tool(name="add_cardinal_knowledge", func=add_cardinal_knowledge, description="将结构化知识添加到数据库知识库。"),
