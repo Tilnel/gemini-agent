@@ -1,0 +1,9 @@
+langchain
+langchain-core
+langchain-google-genai
+langchain-community
+psycopg2-binary
+sentence-transformers
+faiss-cpu
+numpy
+PySocks

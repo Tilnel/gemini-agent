@@ -1,0 +1,8 @@
+*
+*.*
+!*.py
+!requirements.txt
+!.gitignore
+!Makefile
+!config_example.json
+!Dockerfile
