@@ -1,7 +1,9 @@
+# cardinal.py
 import json
 import os
 import time
 import uuid
+import datetime
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
@@ -9,6 +11,7 @@ import faiss
 import numpy as np
 import psycopg2
 import psycopg2.pool
+from bs4 import BeautifulSoup
 from psycopg2.extras import Json
 from sentence_transformers import SentenceTransformer
 
@@ -65,27 +68,29 @@ class CardinalKnowledgeBase:
         if os.path.exists(self.VECTOR_INDEX_FILE):
             print("Loading Faiss index from file...")
             self.faiss_index = faiss.read_index(self.VECTOR_INDEX_FILE)
-            # We still need to populate the mappings
             self._rebuild_faiss_mappings_from_db()
         else:
             print("No Faiss index file found. Rebuilding from database...")
             self._rebuild_faiss_index_from_db()
 
-        print(f"Cardinal KB (DB backend) is ready. Faiss index has {self.faiss_index.ntotal} items.")
+        if self.faiss_index:
+            print(f"Cardinal KB (DB backend) is ready. Faiss index has {self.faiss_index.ntotal} items.")
+        else:
+            print("Cardinal KB is ready, but Faiss index is empty.")
 
     def _rebuild_faiss_mappings_from_db(self):
         """Re-populates the ID mappings from the DB, assuming the Faiss index is loaded."""
         conn = self._get_conn()
         try:
             with conn.cursor() as cur:
-                cur.execute("SELECT id FROM nodes;")
-                all_node_ids = [row[0] for row in cur.fetchall()]
-                for i, node_id in enumerate(all_node_ids):
-                    self._faiss_id_to_node_id[i] = str(node_id)
-                    self._node_id_to_faiss_id[str(node_id)] = i
+                cur.execute("SELECT id FROM nodes ORDER BY timestamp_created;") # Ensure consistent order
+                all_node_ids = [str(row[0]) for row in cur.fetchall()]
+                # This simple mapping assumes the order in the DB matches the Faiss index.
+                # A more robust solution might store faiss_id in the DB.
+                self._faiss_id_to_node_id = {i: node_id for i, node_id in enumerate(all_node_ids)}
+                self._node_id_to_faiss_id = {node_id: i for i, node_id in enumerate(all_node_ids)}
         finally:
             self._put_conn(conn)
-
 
     def _rebuild_faiss_index_from_db(self):
         """Fetches all embeddings from the database and builds a new Faiss index."""
@@ -96,56 +101,131 @@ class CardinalKnowledgeBase:
         conn = self._get_conn()
         try:
             with conn.cursor() as cur:
-                cur.execute("SELECT id, embedding FROM nodes;")
+                cur.execute("SELECT id, embedding FROM nodes ORDER BY timestamp_created;")
                 rows = cur.fetchall()
                 if not rows:
                     print("No nodes in DB to build index from.")
                     return
 
-                all_embeddings = []
-                for i, (node_id, embedding_bytes) in enumerate(rows):
-                    embedding = np.frombuffer(embedding_bytes, dtype=np.float32)
-                    all_embeddings.append(embedding)
-                    node_id_str = str(node_id)
-                    self._faiss_id_to_node_id[i] = node_id_str
-                    self._node_id_to_faiss_id[node_id_str] = i
+                embeddings = np.array([np.frombuffer(row[1], dtype=np.float32) for row in rows])
+                node_ids = [str(row[0]) for row in rows]
 
-                self.faiss_index.add(np.array(all_embeddings))
+                self.faiss_index.add(embeddings)
+                self._faiss_id_to_node_id = {i: node_id for i, node_id in enumerate(node_ids)}
+                self._node_id_to_faiss_id = {node_id: i for i, node_id in enumerate(node_ids)}
+
                 faiss.write_index(self.faiss_index, self.VECTOR_INDEX_FILE)
                 print(f"Rebuilt and saved Faiss index with {len(rows)} vectors.")
         finally:
             self._put_conn(conn)
 
     def _get_embedding(self, text: str) -> np.ndarray:
-        return self.embedding_model.encode(text).astype(np.float32)
+        return self.embedding_model.encode([text], convert_to_numpy=True)[0].astype(np.float32)
 
-    def add_knowledge(self, content: str, node_type: str = "concept", metadata: Optional[Dict[str, Any]] = None) -> Node:
-        node_id = uuid.uuid4()
-        embedding = self._get_embedding(content)
+    def _clean_html_and_extra_whitespace(self, text: str) -> str:
+        """Strips HTML tags and reduces multiple whitespace characters to a single space."""
+        # Check if the content likely contains HTML
+        if '<' in text and '>' in text:
+            soup = BeautifulSoup(text, "lxml")
+            text = soup.get_text(separator=' ', strip=True)
+        # Replace multiple whitespace characters (including newlines, tabs) with a single space
+        return ' '.join(text.split())
 
-        new_node = Node(
-            id=str(node_id), type=node_type, content=content,
-            embedding=embedding, metadata=metadata or {}
-        )
+    def _chunk_text(self, text: str, chunk_size: int, chunk_overlap: int) -> List[str]:
+        """Splits text into overlapping chunks."""
+        if len(text) <= chunk_size:
+            return [text]
+
+        chunks = []
+        start = 0
+        while start < len(text):
+            end = start + chunk_size
+            chunks.append(text[start:end])
+            start += chunk_size - chunk_overlap
+        return chunks
+
+    def add_knowledge(self, content: str, node_type: str = "chunk", metadata: Optional[Dict[str, Any]] = None,
+                      chunk_size: int = 1000, chunk_overlap: int = 150, auto_link_chunks: bool = True) -> List[Node]:
+        """
+        Cleans, chunks, and adds a long piece of content to the knowledge base.
+
+        Args:
+            content: The raw text or HTML content.
+            node_type: The type of node for each chunk (default: "chunk").
+            metadata: Optional metadata to associate with the parent document.
+            chunk_size: The target size of each text chunk in characters.
+            chunk_overlap: The number of characters to overlap between chunks.
+            auto_link_chunks: If True, creates sequential relationships between chunks.
+
+        Returns:
+            A list of Node objects that were created and added.
+        """
+        # 1. Clean the incoming content
+        cleaned_content = self._clean_html_and_extra_whitespace(content)
+        if not cleaned_content:
+            print("Warning: Content was empty after cleaning. No nodes were added.")
+            return []
+
+        # 2. Chunk the cleaned content
+        text_chunks = self._chunk_text(cleaned_content, chunk_size, chunk_overlap)
+
+        parent_doc_id = str(uuid.uuid4())
+        created_nodes: List[Node] = []
 
         conn = self._get_conn()
         try:
             with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    INSERT INTO nodes (id, type, content, embedding, metadata)
-                    VALUES (%s, %s, %s, %s, %s);
-                    """,
-                    (str(node_id), node_type, content, embedding.tobytes(), Json(metadata or {}))
-                )
-                conn.commit()
+                for i, chunk in enumerate(text_chunks):
+                    # 3. For each chunk, create a node
+                    node_id = str(uuid.uuid4())
+                    embedding = self._get_embedding(chunk)
+
+                    chunk_metadata = (metadata or {}).copy()
+                    chunk_metadata.update({
+                        "parent_document_id": parent_doc_id,
+                        "chunk_index": i,
+                        "total_chunks": len(text_chunks)
+                    })
+
+                    new_node = Node(
+                        id=node_id, type=node_type, content=chunk,
+                        embedding=embedding, metadata=chunk_metadata
+                    )
+
+                    # 4. Insert node into the database
+                    cur.execute(
+                        """
+                        INSERT INTO nodes (id, type, content, embedding, metadata, timestamp_created)
+                        VALUES (%s, %s, %s, %s, %s, %s);
+                        """,
+                        (node_id, node_type, chunk, embedding.tobytes(), Json(chunk_metadata), datetime.datetime.fromtimestamp(new_node.timestamp_created, tz=datetime.timezone.utc))
+                    )
+                    created_nodes.append(new_node)
+
+            conn.commit()
+            print(f"Added {len(created_nodes)} chunks to DB for document {parent_doc_id}.")
+
+            # 5. Optionally, link the chunks sequentially
+            if auto_link_chunks and len(created_nodes) > 1:
+                for i in range(len(created_nodes) - 1):
+                    source_node = created_nodes[i]
+                    target_node = created_nodes[i+1]
+                    self.add_relationship(source_node.id, target_node.id, "is_followed_by")
+                print(f"Created {len(created_nodes) - 1} sequential relationships.")
+
+        except psycopg2.Error as e:
+            print(f"Database error during knowledge addition: {e}")
+            conn.rollback()
+            return [] # Return empty list on failure
         finally:
             self._put_conn(conn)
 
-        # For simplicity, we'll rely on a periodic or startup rebuild of Faiss.
+        # For simplicity, we still rely on a periodic or startup rebuild of Faiss.
         # A more advanced implementation would add this to the index in real-time.
-        print(f"Node {node_id} added to DB. Faiss index will update on next restart.")
-        return new_node
+        print("Faiss index will update on next restart. Rebuilding now for immediate use...")
+        self._rebuild_faiss_index_from_db() # Added for immediate usability
+
+        return created_nodes
 
     def add_relationship(self, source_id: str, target_id: str, rel_type: str, metadata: Optional[Dict[str, Any]] = None) -> Optional[Edge]:
         edge_id = uuid.uuid4()
@@ -154,7 +234,6 @@ class CardinalKnowledgeBase:
         conn = self._get_conn()
         try:
             with conn.cursor() as cur:
-                # Add the edge
                 cur.execute(
                     """
                     INSERT INTO edges (id, source_node_id, target_node_id, type, metadata)
@@ -162,7 +241,6 @@ class CardinalKnowledgeBase:
                     """,
                     (str(edge_id), source_id, target_id, rel_type, Json(metadata or {}))
                 )
-                # Update connectivity counts
                 cur.execute("UPDATE nodes SET connectivity = connectivity + 1 WHERE id IN (%s, %s);", (source_id, target_id))
                 conn.commit()
         except psycopg2.Error as e:
@@ -174,42 +252,55 @@ class CardinalKnowledgeBase:
 
         return new_edge
 
-    def consult(self, query: str, top_k: int = 5, association_depth: int = 1) -> List[Dict[str, Any]]:
+    def consult(self, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
+        if not self.faiss_index or self.faiss_index.ntotal == 0:
+            print("Cannot consult: Faiss index is empty.")
+            return []
+
         query_embedding = self._get_embedding(query)
         D, I = self.faiss_index.search(np.array([query_embedding]), top_k)
 
-        initial_node_ids = [self._faiss_id_to_node_id[faiss_id] for faiss_id in I[0] if faiss_id != -1]
-        if not initial_node_ids:
+        faiss_ids = I[0]
+        distances = D[0]
+
+        # Filter out invalid Faiss IDs (-1)
+        valid_indices = [i for i, fid in enumerate(faiss_ids) if fid != -1]
+        if not valid_indices:
             return []
 
-        # Fetch node data from DB
+        initial_node_ids = [self._faiss_id_to_node_id[faiss_ids[i]] for i in valid_indices]
+
         conn = self._get_conn()
         try:
             with conn.cursor() as cur:
-                results = []
-                seen_nodes = set()
-
-                # Fetch initial semantic matches
-                cur.execute("SELECT id, type, content, metadata FROM nodes WHERE id like ANY(%s);", (initial_node_ids,))
-
+                # Using tuple for IN clause for performance
+                cur.execute("SELECT id, type, content, metadata FROM nodes WHERE id IN %s;", (tuple(initial_node_ids),))
                 rows = cur.fetchall()
 
-                id_to_row = {str(row[0]): row for row in rows}
+                # Map results for easy lookup and to preserve Faiss order
+                node_data_map = {str(row[0]): {'type': row[1], 'content': row[2], 'metadata': row[3]} for row in rows}
 
-                for i, node_id in enumerate(initial_node_ids):
-                    if node_id in id_to_row and node_id not in seen_nodes:
-                        row = id_to_row[node_id]
-                        node = Node(id=str(row[0]), type=row[1], content=row[2], metadata=row[3], embedding=np.array([]))
-                        similarity = 1 - (D[0][i] / 2)
-                        results.append({"node": node, "similarity": similarity, "source": "semantic_search"})
-                        seen_nodes.add(node_id)
+                results = []
+                for i in valid_indices:
+                    faiss_id = faiss_ids[i]
+                    distance = distances[i]
+                    node_id = self._faiss_id_to_node_id.get(faiss_id)
 
-                # In a production system, graph traversal would be a complex recursive SQL query.
-                # For simplicity here, we keep the traversal logic similar to the file-based one,
-                # which means it's not fully optimized for a DB but demonstrates the principle.
-                # A true graph DB or advanced SQL would be better for deep traversals.
+                    if node_id and node_id in node_data_map:
+                        data = node_data_map[node_id]
+                        # L2 distance is squared, similarity can be represented in various ways.
+                        # 1 / (1 + L2_distance) is a common one.
+                        similarity = 1 / (1 + distance)
 
-                return results[:top_k]
+                        results.append({
+                            "id": node_id,
+                            "content": data['content'],
+                            "type": data['type'],
+                            "metadata": data['metadata'],
+                            "similarity": similarity,
+                            "source": "semantic_search"
+                        })
+                return results
         finally:
             self._put_conn(conn)
 

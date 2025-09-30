@@ -66,7 +66,7 @@ def _auto_learn_from_observation(tool_name: str, tool_input: str, observation: s
             content=knowledge_content,
             node_type='tool_observation',
             metadata=metadata
-        )
+        )[0]
         print(f"[Auto-Learning] Added knowledge from {tool_name} (ID: {node.id})")
     except Exception as e:
         print(f"[Auto-Learning Error] Failed to add knowledge from {tool_name}: {e}")
@@ -151,10 +151,14 @@ def add_cardinal_relationship(json_str_input: str) -> str:
         return f"添加关系到数据库失败: {e}"
 
 def consult_cardinal_knowledge(query: str) -> str:
+    """从数据库知识库中查询相关知识。"""
     results = global_knowledge_base.consult(query)
     if not results:
         return "在数据库知识库中未找到相关知识。"
-    formatted = [f"- ID: {res['node'].id}, 内容: {res['node'].content[:150]}... (相似度: {res['similarity']:.2f})" for res in results]
+
+    # 新格式: res['id'] 和 res['content']
+    formatted = [f"- ID: {res['id']}, 内容: {res['content'][:150]}... (相似度: {res['similarity']:.2f})" for res in results]
+
     return "从数据库中查询到以下信息:\n" + "\n".join(formatted)
 
 tools = [
@@ -162,8 +166,8 @@ tools = [
     Tool(name="google_search", func=create_learning_wrapper(search.run, "google_search"), description="当需要从互联网获取信息时使用。当你采信某个信源的时候，应当给出来源的网页。注意避免采取“今日”等模糊的日期指示，而是替换为真实的日期。"),
     Tool(name="fetch_webpage", func=create_learning_wrapper(fetch_webpage_content, "fetch_webpage"), description="获取特定 URL 的完整网页内容。输入应为一个有效的 URL。"),
     Tool(name="write_file", func=write_file, description="将内容写入文件。输入必须是包含 'file_path' 和 'content' 的JSON字符串。"),
-    Tool(name="add_cardinal_knowledge", func=add_cardinal_knowledge, description="将结构化知识添加到数据库知识库。"),
-    Tool(name="add_cardinal_relationship", func=add_cardinal_relationship, description="在数据库中的两个知识节点之间添加关系。"),
+    # Tool(name="add_cardinal_knowledge", func=add_cardinal_knowledge, description="将结构化知识添加到数据库知识库。格式为包含 'content'(raw text or html content) 的 JSON。"),
+    # Tool(name="add_cardinal_relationship", func=add_cardinal_relationship, description="在数据库中的两个知识节点之间添加关系。"),
     Tool(name="consult_cardinal_knowledge", func=consult_cardinal_knowledge, description="从数据库知识库中查询相关知识。"),
 ]
 
